@@ -270,14 +270,29 @@ This is a boilerplate project. For issues:
 3. Ensure all environment variables are properly configured
 4. Verify database connection and Solana network access
 
-## 🙏 Acknowledgments
+## 📖 Resources & References
 
-Built with modern technologies and best practices:
-- [Next.js](https://nextjs.org/) for the React framework
-- [Prisma](https://www.prisma.io/) for type-safe database access
-- [Privy](https://privy.io/) for Web3 authentication
-- [Solana](https://solana.com/) for fast blockchain operations
-- [TypeScript](https://www.typescriptlang.org/) for type safety
+### 🔗 **Key Documentation**
+- **[Solana Attestation Service](https://attest.solana.com/)** - Official SAS documentation and SDK
+- **[Privy Documentation](https://docs.privy.io/)** - Web3 authentication integration guide
+- **[Solana Web3.js](https://solana-labs.github.io/solana-web3.js/)** - Solana blockchain interaction library
+- **[Prisma Documentation](https://www.prisma.io/docs)** - Database ORM and migration guide
+- **[Next.js App Router](https://nextjs.org/docs/app)** - Modern React framework documentation
+
+### 🛠️ **Implementation Examples**
+- **[SAS Implementation Example](https://github.com/saidubundukamara/solana-attestation-service-example)** - Real-world SAS integration patterns
+- **[Privy Authentication Examples](https://docs.privy.io/guide/react/authentication)** - Multi-wallet auth implementation
+- **[Repository Pattern in TypeScript](https://blog.logrocket.com/implementing-repository-pattern-typescript/)** - Clean architecture patterns
+
+### 🎓 **Academic Credential Standards**
+- **[W3C Verifiable Credentials](https://www.w3.org/TR/vc-data-model/)** - Standard for digital credentials
+- **[Blockcerts](https://www.blockcerts.org/)** - Open standard for blockchain certificates
+- **[MIT Digital Diplomas](https://news.mit.edu/2017/mit-first-university-issue-blockchain-certificates-1017)** - Real-world implementation case study
+
+### ⛓️ **Blockchain Development**
+- **[Solana Program Library](https://spl.solana.com/)** - Standard Solana programs and utilities
+- **[Solana Cookbook](https://solanacookbook.com/)** - Practical Solana development guide
+
 
 ---
 

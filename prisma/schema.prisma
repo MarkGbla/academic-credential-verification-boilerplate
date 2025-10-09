@@ -1,0 +1,131 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model University {
+  id          String   @id @default(uuid())
+  name        String
+  code        String   @unique
+  country     String
+  email       String   @unique
+  wallet      String?  // Solana wallet address
+  publicKey   String   // Verification public key
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  credentials Credential[]
+  
+  @@map("universities")
+}
+
+model Student {
+  id           String   @id @default(uuid())
+  ninHash      String   @unique // Hashed NIN for privacy
+  firstName    String
+  lastName     String
+  email        String   @unique
+  wallet       String?  // Solana wallet address
+  solanaAddress String @unique // Derived from NIN
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  
+  credentials  Credential[]
+  attestations Attestation[]
+  
+  @@map("students")
+}
+
+model Government {
+  id        String   @id @default(uuid())
+  name      String   // e.g., "Ministry of Education"
+  type      GovernmentType
+  country   String
+  wallet    String?  // Solana wallet address
+  publicKey String   // Verification public key
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  attestations Attestation[]
+  
+  @@map("government_entities")
+}
+
+model Credential {
+  id              String     @id @default(uuid())
+  title           String     // e.g., "Bachelor of Computer Science"
+  degreeType      DegreeType
+  major           String?
+  graduationDate  DateTime
+  gpa             Float?
+  issuanceDate    DateTime   @default(now())
+  expiryDate      DateTime?
+  status          CredentialStatus @default(ACTIVE)
+  metadata        Json       // Additional credential data
+  
+  universityId    String
+  university      University @relation(fields: [universityId], references: [id])
+  studentId       String
+  student         Student    @relation(fields: [studentId], references: [id])
+  
+  attestations    Attestation[]
+  
+  @@map("credentials")
+}
+
+model Attestation {
+  id                String      @id @default(uuid())
+  solanaAddress     String      @unique // On-chain attestation address
+  transactionHash   String      @unique // Solana transaction hash
+  attestationType   AttestationType
+  status            AttestationStatus @default(PENDING)
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+  
+  credentialId      String
+  credential        Credential  @relation(fields: [credentialId], references: [id])
+  studentId         String
+  student           Student     @relation(fields: [studentId], references: [id])
+  governmentId      String?
+  government        Government? @relation(fields: [governmentId], references: [id])
+  
+  @@map("attestations")
+}
+
+enum GovernmentType {
+  MINISTRY_OF_EDUCATION
+  MINISTRY_OF_FOREIGN_AFFAIRS
+  ACCREDITATION_BODY
+}
+
+enum DegreeType {
+  BACHELOR
+  MASTER
+  DOCTORATE
+  DIPLOMA
+  CERTIFICATE
+}
+
+enum CredentialStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+enum AttestationType {
+  UNIVERSITY_ISSUED
+  GOVERNMENT_ACCREDITED
+}
+
+enum AttestationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}

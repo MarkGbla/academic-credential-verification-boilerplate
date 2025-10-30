@@ -1,7 +1,23 @@
 import { ICredentialRepository, IAttestationRepository } from '../database/repositories';
 import { CredentialWithRelations } from '../types/credential';
 import { AttestationService } from './AttestationService';
-import { ERROR_MESSAGES } from '../utils/constants';
+import { 
+  ERROR_MESSAGES,
+  ValidationError,
+  NotFoundError,
+  UnauthorizedError,
+  BlockchainError,
+  TransactionError
+} from '../errors';
+import { PrismaClient } from '@prisma/client';
+
+export interface VerificationOptions {
+  requireGovernmentApproval?: boolean;
+  checkExpiration?: boolean;
+  verifyOnChain?: boolean;
+  maxRetries?: number;
+  retryDelay?: number;
+}
 
 export interface VerificationResult {
   isValid: boolean;
@@ -18,16 +34,53 @@ export interface VerificationResult {
 }
 
 export class VerificationService {
+  private readonly maxRetries: number;
+  private readonly retryDelay: number;
+
   constructor(
-    private credentialRepo: ICredentialRepository,
-    private attestationRepo: IAttestationRepository,
-    private attestationService: AttestationService
-  ) {}
+    private readonly credentialRepo: ICredentialRepository,
+    private readonly attestationRepo: IAttestationRepository,
+    private readonly attestationService: AttestationService,
+    private readonly prisma: PrismaClient,
+    options: VerificationOptions = {}
+  ) {
+    this.maxRetries = options.maxRetries ?? 3;
+    this.retryDelay = options.retryDelay ?? 1000; // 1 second
+  }
+
+  /**
+   * Verify a credential by ID with retry logic
+   */
+  private async withRetry<T>(
+    operation: () => Promise<T>,
+    errorMessage: string,
+    retryCount = 0
+  ): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (retryCount >= this.maxRetries) {
+        throw new Error(`${errorMessage} after ${this.maxRetries} attempts: ${error.message}`);
+      }
+      
+      // Exponential backoff
+      const delay = this.retryDelay * Math.pow(2, retryCount);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      
+      return this.withRetry(operation, errorMessage, retryCount + 1);
+    }
+  }
 
   /**
    * Verify a credential by ID (public verification)
+   * @param credentialId The ID of the credential to verify
+   * @param options Verification options
+   * @returns Verification result with detailed status
    */
-  async verifyCredential(credentialId: string): Promise<VerificationResult> {
+  async verifyCredential(
+    credentialId: string,
+    options: VerificationOptions = {}
+  ): Promise<VerificationResult> {
     const errors: string[] = [];
     const verificationDetails = {
       credentialExists: false,
@@ -37,11 +90,88 @@ export class VerificationService {
       blockchainVerified: false,
     };
 
-    try {
-      // Check if credential exists
-      const credential = await this.credentialRepo.findByIdWithRelations(credentialId);
-      if (!credential) {
-        errors.push(ERROR_MESSAGES.CREDENTIAL_NOT_FOUND);
+    // Use transaction for atomic operations
+    return this.prisma.$transaction(async (tx) => {
+      try {
+        // Check if credential exists
+        const credential = await this.credentialRepo.findByIdWithRelations(credentialId);
+        if (!credential) {
+          throw new NotFoundError(ERROR_MESSAGES.CREDENTIAL_NOT_FOUND);
+        }
+
+        verificationDetails.credentialExists = true;
+
+        // Check if credential is active
+        if (credential.status === 'REVOKED') {
+          throw new ValidationError(ERROR_MESSAGES.CREDENTIAL_REVOKED);
+        }
+
+        // Check expiration if enabled
+        if (options.checkExpiration !== false) {
+          const now = new Date();
+          if (credential.status === 'EXPIRED' || 
+              (credential.expiryDate && credential.expiryDate < now)) {
+            throw new ValidationError(ERROR_MESSAGES.CREDENTIAL_EXPIRED);
+          }
+        }
+        verificationDetails.credentialActive = true;
+
+        // Verify attestation chain with retry logic
+        const authenticity = await this.withRetry(
+          () => this.attestationService.verifyCredentialAuthenticity(credentialId),
+          'Failed to verify credential authenticity'
+        );
+        
+        verificationDetails.universityVerified = authenticity.universityVerified;
+        verificationDetails.governmentAccredited = authenticity.governmentVerified;
+        verificationDetails.blockchainVerified = authenticity.isAuthentic;
+
+        if (authenticity.errors.length > 0) {
+          errors.push(...authenticity.errors);
+        }
+
+        // Additional verification if required
+        if (options.verifyOnChain) {
+          // Implement on-chain verification logic here
+          // This would involve checking the blockchain state
+        }
+
+        const isValid = verificationDetails.credentialExists &&
+                        verificationDetails.credentialActive &&
+                        verificationDetails.universityVerified &&
+                        verificationDetails.blockchainVerified &&
+                        (options.requireGovernmentApproval ? 
+                          verificationDetails.governmentAccredited : true);
+
+        return {
+          isValid,
+          credential,
+          verificationDetails,
+          errors: errors.length > 0 ? errors : undefined,
+          verifiedAt: new Date(),
+        };
+
+      } catch (error) {
+        // Handle specific error types
+        if (error instanceof ValidationError || 
+            error instanceof NotFoundError || 
+            error instanceof UnauthorizedError) {
+          errors.push(error.message);
+        } else if (error instanceof BlockchainError || 
+                  error instanceof TransactionError) {
+          errors.push(`${ERROR_MESSAGES.BLOCKCHAIN_ERROR}: ${error.message}`);
+          // Log additional details for blockchain errors
+          console.error('Blockchain error details:', {
+            code: error['code'],
+            txSignature: error['txSignature'],
+            logs: error['logs']
+          });
+        } else {
+          // For unexpected errors, log the full error but return a generic message
+          console.error('Unexpected error during verification:', error);
+          errors.push('An unexpected error occurred during verification');
+        }
+
         return {
           isValid: false,
           verificationDetails,
@@ -49,52 +179,7 @@ export class VerificationService {
           verifiedAt: new Date(),
         };
       }
-
-      verificationDetails.credentialExists = true;
-
-      // Check if credential is active
-      if (credential.status === 'REVOKED') {
-        errors.push(ERROR_MESSAGES.CREDENTIAL_REVOKED);
-      } else if (credential.status === 'EXPIRED' || 
-                 (credential.expiryDate && credential.expiryDate < new Date())) {
-        errors.push(ERROR_MESSAGES.CREDENTIAL_EXPIRED);
-      } else {
-        verificationDetails.credentialActive = true;
-      }
-
-      // Verify attestation chain
-      const authenticity = await this.attestationService.verifyCredentialAuthenticity(credentialId);
-      
-      verificationDetails.universityVerified = authenticity.universityVerified;
-      verificationDetails.governmentAccredited = authenticity.governmentVerified;
-      verificationDetails.blockchainVerified = authenticity.isAuthentic;
-
-      if (authenticity.errors.length > 0) {
-        errors.push(...authenticity.errors);
-      }
-
-      const isValid = verificationDetails.credentialExists &&
-                      verificationDetails.credentialActive &&
-                      verificationDetails.universityVerified &&
-                      verificationDetails.blockchainVerified;
-
-      return {
-        isValid,
-        credential,
-        verificationDetails,
-        errors,
-        verifiedAt: new Date(),
-      };
-
-    } catch (error) {
-      errors.push(`Verification failed: ${error.message}`);
-      return {
-        isValid: false,
-        verificationDetails,
-        errors,
-        verifiedAt: new Date(),
-      };
-    }
+    });
   }
 
   /**
@@ -177,15 +262,13 @@ export class VerificationService {
   /**
    * Batch verify multiple credentials
    */
-  async batchVerifyCredentials(credentialIds: string[]): Promise<{
-    results: Array<{
-      credentialId: string;
-      result: VerificationResult;
-    }>;
-    summary: {
-      total: number;
-      valid: number;
-      invalid: number;
+  async batchVerifyCredentials(
+    credentialIds: string[],
+    options: VerificationOptions = {}
+  ): Promise<{ [credentialId: string]: VerificationResult }> {
+    // Process verifications in parallel with a concurrency limit
+    const BATCH_SIZE = 5;
+    const results: { [credentialId: string]: VerificationResult } = {};
     };
   }> {
     const results = await Promise.all(

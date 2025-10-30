@@ -1,16 +1,225 @@
-import { IAttestationRepository, ICredentialRepository } from '../database/repositories';
-import { AttestationWithRelations } from '../types/attestation';
+import { IAttestationRepository, ICredentialRepository, IStudentRepository, IUniversityRepository } from '../database/repositories';
+import { AttestationStatus, AttestationType, AttestationWithRelations, CreateAttestationData as CreateAttestationDataType } from '../types/attestation';
 import { SolanaAttestationService } from '../solana/attestation';
+import { NINService } from './NINService';
 import { ERROR_MESSAGES } from '../utils/constants';
+import { BlockchainService } from './BlockchainService';
+import { CredentialService } from './CredentialService';
+
+export interface CreateAttestationParams {
+  studentNIN: string;
+  universityId: string;
+  credentialType: string;
+  metadata?: Record<string, any>;
+  requestedBy: string; // User ID of the requester
+}
+
+export interface ReviewAttestationParams {
+  attestationId: string;
+  status: 'APPROVED' | 'REJECTED';
+  reviewedBy: string; // User ID of the reviewer
+  comments?: string;
+}
 
 export class AttestationService {
   private solanaService: SolanaAttestationService;
+  private blockchainService: BlockchainService;
+  private credentialService: CredentialService;
 
   constructor(
     private attestationRepo: IAttestationRepository,
-    private credentialRepo: ICredentialRepository
+    private credentialRepo: ICredentialRepository,
+    private studentRepo: IStudentRepository,
+    private universityRepo: IUniversityRepository,
+    blockchainConfig: {
+      rpcUrl: string;
+      programId: string;
+      walletPrivateKey: string;
+    }
   ) {
     this.solanaService = new SolanaAttestationService();
+    this.blockchainService = new BlockchainService(blockchainConfig);
+    this.credentialService = new CredentialService(credentialRepo, this.blockchainService);
+  }
+
+  /**
+   * Create a new attestation request
+   */
+  async createAttestation(params: CreateAttestationParams): Promise<{
+    success: boolean;
+    attestation?: AttestationWithRelations;
+    error?: string;
+  }> {
+    try {
+      // 1. Validate student NIN
+      const ninValidation = NINService.validateNIN(params.studentNIN);
+      if (!ninValidation.isValid) {
+        return { success: false, error: ninValidation.error };
+      }
+
+      // 2. Verify university exists and is active
+      const university = await this.universityRepo.findById(params.universityId);
+      if (!university || !university.isActive) {
+        return { 
+          success: false, 
+          error: 'University not found or inactive' 
+        };
+      }
+
+      // 3. Check for existing attestation request
+      const existingAttestations = await this.attestationRepo.findMany({
+        where: {
+          student: { nin: params.studentNIN },
+          credential: {
+            universityId: params.universityId,
+            type: params.credentialType,
+          },
+        },
+        take: 1,
+      });
+      
+      const existingAttestation = existingAttestations[0] as AttestationWithRelations | undefined;
+
+      if (existingAttestation) {
+        return {
+          success: false,
+          error: 'An attestation request already exists for this student and credential type',
+        };
+      }
+
+      // 4. Create credential first (or get existing)
+      // TODO: You'll need to get the studentId from the database or another service
+      // For now, we'll use the NIN as the studentId, but this should be fixed
+      const credential = await this.credentialRepo.create({
+        title: `${params.credentialType} Credential`,
+        degreeType: 'BACHELORS', // This should come from params or config
+        graduationDate: new Date(), // This should come from params
+        universityId: params.universityId,
+        studentId: params.studentNIN, // This should be the actual student ID, not NIN
+        metadata: params.metadata || {},
+      });
+
+      // 5. Create attestation record
+      const attestationData: CreateAttestationDataType = {
+        credentialId: credential.id,
+        studentId: params.studentNIN, // This should be the student's ID, not NIN - needs to be fixed in the schema
+        attestationType: AttestationType.UNIVERSITY_ISSUED,
+        solanaAddress: '', // Will be set after blockchain operation
+        transactionHash: '', // Will be set after blockchain operation
+      };
+
+      const attestation = await this.attestationRepo.create(attestationData);
+
+      // Fetch the full attestation with relations
+      const createdAttestation = await this.attestationRepo.findByIdWithRelations(attestation.id);
+      if (!createdAttestation) {
+        throw new Error('Failed to fetch created attestation');
+      }
+      
+      return { success: true, attestation: createdAttestation };
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Failed to create attestation request';
+      return { 
+        success: false, 
+        error: errorMessage 
+      };
+    }
+  }
+
+  /**
+   * Review and approve/reject an attestation
+   */
+  async reviewAttestation(params: ReviewAttestationParams): Promise<{
+    success: boolean;
+    attestation?: AttestationWithRelations;
+    credential?: any; // Credential type from CredentialService
+    error?: string;
+  }> {
+    // Note: If you need transactions, you'll need to implement a transaction wrapper
+    // since the repository interface doesn't currently support sessions
+    // For now, we'll proceed without transaction support
+
+    try {
+      // 1. Get and validate attestation
+      const attestation = await this.attestationRepo.findById(params.attestationId);
+      if (!attestation) {
+        // Transaction handling removed - implement if needed
+        return { 
+          success: false, 
+          error: ERROR_MESSAGES.ATTESTATION_NOT_FOUND 
+        };
+      }
+
+      // 2. Check if attestation is in a reviewable state
+      if (attestation.status !== AttestationStatus.PENDING) {
+        // Transaction handling removed - implement if needed
+        return { 
+          success: false, 
+          error: 'Attestation is not in a reviewable state' 
+        };
+      }
+
+      // 3. Update attestation status
+      const updatedAttestation = await this.attestationRepo.update(
+        params.attestationId,
+        {
+          status: params.status,
+          // Add reviewedBy and comments to the UpdateAttestationData interface if needed
+          // For now, we'll just update the status
+        }
+      );
+      
+      // Manually add the reviewedAt and reviewedBy fields to the returned object
+      const updatedWithReviewInfo = {
+        ...updatedAttestation,
+        reviewedAt: new Date(),
+        reviewedBy: params.reviewedBy,
+        comments: params.comments,
+      };
+
+      // 4. If approved, issue the credential
+      let credentialResult;
+      if (params.status === 'APPROVED') {
+        credentialResult = await this.credentialService.issueCredential({
+          studentNIN: attestation.studentId, // Using studentId from attestation
+          universityId: attestation.credential.universityId,
+          credentialType: attestation.credential.type,
+          metadata: {
+            ...(attestation.credential.metadata || {}),
+            attestationId: attestation.id,
+          },
+          issuedBy: params.reviewedBy,
+        });
+
+        if (!credentialResult.success) {
+          return { 
+            success: false, 
+            error: `Failed to issue credential: ${credentialResult.error}`,
+          };
+        }
+
+        // Update attestation with credential reference
+        // Note: The credentialId should be part of the attestation already
+        // since we created the credential first
+      }
+
+      // 5. TODO: Send notification to relevant parties
+      // this.notificationService.notifyAttestationStatusUpdate(updatedWithReviewInfo);
+
+      return { 
+        success: true, 
+        attestation: updatedWithReviewInfo as AttestationWithRelations,
+        credential: credentialResult?.credential,
+      };
+    } catch (error: unknown) {
+      // If transaction support is added, uncomment this:
+      // await session.abortTransaction();
+      const errorMessage = error instanceof Error ? error.message : 'Failed to process attestation review';
+      return { 
+        success: false, 
+        error: errorMessage 
+      };
+    }
   }
 
   /**
@@ -30,7 +239,40 @@ export class AttestationService {
         };
       }
 
-      // Verify on-chain existence
+      // If attestation was rejected, no need to check blockchain
+      if (attestation.status === AttestationStatus.REJECTED) {
+        return {
+          isValid: false,
+          error: 'Attestation was rejected',
+        };
+      }
+
+      // If attestation is pending, it won't be on-chain yet
+      if (attestation.status === AttestationStatus.PENDING) {
+        return {
+          isValid: false,
+          error: 'Attestation is still pending review',
+        };
+      }
+
+      // If we have a credential, verify it instead
+      if (attestation.credential) {
+        const verification = await this.credentialService.verifyCredential(attestation.credential.id);
+        return {
+          isValid: verification.isValid,
+          onChainData: verification.credential?.verificationData,
+          error: verification.error,
+        };
+      }
+
+      // Fallback to direct blockchain verification
+      if (!attestation.solanaAddress) {
+        return {
+          isValid: false,
+          error: 'No blockchain address found for this attestation',
+        };
+      }
+
       const isOnChain = await this.solanaService.verifyAttestation(attestation.solanaAddress);
       if (!isOnChain) {
         return {
@@ -39,17 +281,17 @@ export class AttestationService {
         };
       }
 
-      // Get on-chain data
       const onChainData = await this.solanaService.getAttestationData(attestation.solanaAddress);
 
       return {
         isValid: true,
         onChainData,
       };
-    } catch (error) {
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Failed to verify attestation';
       return {
         isValid: false,
-        error: error.message,
+        error: errorMessage,
       };
     }
   }
@@ -129,8 +371,9 @@ export class AttestationService {
         governmentVerified,
         errors,
       };
-    } catch (error) {
-      errors.push(error.message);
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      errors.push(errorMessage);
       return {
         isAuthentic: false,
         universityVerified,
@@ -182,11 +425,12 @@ export class AttestationService {
         authorityBalance: balance,
         // blockHeight could be fetched from connection
       };
-    } catch (error) {
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       return {
         isConnected: false,
         authorityBalance: 0,
-        error: error.message,
+        error: errorMessage,
       };
     }
   }
